@@ -446,10 +446,10 @@ unsigned discretize_uft_value(s64 uft_value) {
 	/* 每个分组对应一个唯一的状态，不需要重新映射 */
 	
 	/* 每执行100次离散化，打印一次分组信息 */
-	discretizer_print_count++;
-	if (discretizer_print_count % 100 == 0) {
-		print_discretizer_groups();
-	}
+	// discretizer_print_count++;
+	// if (discretizer_print_count % 100 == 0) {
+	// 	print_discretizer_groups();
+	// }
 	
 	return best_group % 64;  /* 安全防护：确保不超过64 */
 }
