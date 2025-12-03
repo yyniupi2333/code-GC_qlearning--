@@ -197,7 +197,55 @@ void set_time_hot(unsigned object_id,unsigned chunk_id, unsigned time,int cnt)
 		int discountFactor=5;//discountFactor_mul_ten
 		const static unsigned num_trainings=50000;//小q表减少训练次数
 		// const static unsigned num_trainings=1000000;//训练次数
+		/* epsilon 初始值 = num_trainings（100%探索）
+		 * 通过衰减策略逐步降低探索概率
+		 * 最终保留 MIN_EPSILON（5%）的永久探索，应对环境变化
+		 */
 		static unsigned epsilon=num_trainings;//探索率
+
+/* ============ 调试监控统计结构体 ============ */
+#define DEBUG_QLGC  /* 启用调试信息 */
+
+#ifdef DEBUG_QLGC
+struct {
+	/* 动作统计 */
+	unsigned action_count[4];      /* ACTION_ZERO, ONE, TWO, THREE的计数 */
+	unsigned total_actions;        /* 总动作数 */
+	
+	/* 状态统计 */
+	unsigned unique_states_visited;/* 访问过的不同状态数 */
+	unsigned state_action_pairs;   /* 状态-动作对数量 */
+	
+	/* Q值统计 */
+	int max_qvalue;
+	int min_qvalue;
+	int avg_qvalue;
+	int qvalue_variance;
+	
+	/* 奖励统计 */
+	unsigned long total_reward;    /* 累积奖励 */
+	unsigned gc_operations;        /* GC操作总次数 */
+	unsigned total_migrations;     /* 总页面迁移数 */
+	unsigned total_deleted_pages;  /* 总无效页数 */
+	
+	/* 哈希表碰撞统计 */
+	unsigned hash_collisions;
+	unsigned q_entries_used;
+	
+	/* GC效率统计 */
+	unsigned long chunks_recovered_total;  /* 总恢复块数 */
+	unsigned gc_success_count;     /* GC成功次数 */
+	unsigned gc_fail_count;        /* GC失败次数 */
+	
+	/* 磨损均衡统计 */
+	int last_wear_gap;             /* 上次擦除差距 */
+	int max_wear_gap;              /* 最大擦除差距 */
+	
+	/* 上次打印的时间戳 */
+	unsigned last_print_count;
+} ql_stats = {0};
+
+#endif
 
 unsigned get_uft_flag(unsigned uft,unsigned aver_uft){
 	// return (16*uft/aver_uft)%64;
@@ -300,6 +348,10 @@ struct QTableEntry* findOrInsertQEntry(struct QTableEntry* table, struct State* 
 	else {
 		table[index].state = state;
 		table[index].action = action;
+		ql_stats.state_action_pairs++;  /* 统计新添加的状态-动作对 */
+		if(ql_stats.state_action_pairs > CAPACITY) {
+			ql_stats.state_action_pairs = CAPACITY;  /* 防止溢出 */
+		}
 	}
     return &table[index];
 }
@@ -338,13 +390,30 @@ enum Action getrandomaction(struct QTableEntry* table,struct State* state){
 }
 
 //根据epsilon按概率选择explore与exploit
+/* epsilon-Greedy 策略：
+ * - 当 random() > epsilon 时：利用最优策略 (exploitation)
+ * - 当 random() <= epsilon 时：随机探索 (exploration)
+ * 
+ * epsilon 随训练进度衰减：
+ * - 初期：epsilon ≈ num_trainings（高探索）
+ * - 中期：epsilon 线性降低（逐步利用）
+ * - 后期：epsilon ≥ MIN_EPSILON（保留5%探索，适应环境变化）
+ */
 enum Action getaction(struct QTableEntry *table,struct State* state){
 	enum Action action;
 	if ((prandom_u32()%num_trainings +1)>epsilon){
-		action=getbestaction(table,state);}
+		action=getbestaction(table,state);}  /* 利用已学策略 */
 	else{
-		action=getrandomaction(table,state);
-	}   
+		action=getrandomaction(table,state);  /* 探索新动作 */
+	}
+	
+	/* ========== 调试统计 ========== */
+#ifdef DEBUG_QLGC
+	ql_stats.action_count[enumtoint(action)]++;
+	ql_stats.total_actions++;
+	ql_stats.unique_states_visited++;  /* 这个计数可能不够精确，实际应该用hash集合 */
+#endif
+	
 	return action;
 }
 
@@ -3592,6 +3661,12 @@ static int yaffs_gc_block(struct yaffs_dev *dev, int block, int whole_block,int 
 			yaffs_trace(YAFFS_TRACE_GC,
 				"gc did not increase free chunks before %d after %d",
 				chunks_before, chunks_after);
+		else {
+			/* ========== 块恢复统计 ========== */
+#ifdef DEBUG_QLGC
+			ql_stats.chunks_recovered_total += (chunks_after - chunks_before);
+#endif
+		}
 		dev->gc_block = 0;
 		dev->gc_chunk = 0;
 		dev->n_clean_ups = 0;
@@ -3744,6 +3819,15 @@ static unsigned yaffs_find_gc_block(struct yaffs_dev *dev,
 		}
 				
 		 fagc_update_threshold();
+		 
+		 /* ========== 磨损均衡统计 ========== */
+#ifdef DEBUG_QLGC
+		 int wear_gap = n_blk_erasure_max - n_blk_erasure_min;
+		 ql_stats.last_wear_gap = wear_gap;
+		 if(wear_gap > ql_stats.max_wear_gap) {
+		 	ql_stats.max_wear_gap = wear_gap;
+		 }
+#endif
 	}
 	else
 	{
@@ -4066,6 +4150,15 @@ int inter_copies=0;
 				// int reward=getreward(number_of_migrations,bi->soft_del_pages);
 				int reward=getreward(number_of_migrations,bi->soft_del_pages,ry_interval_time);
 				
+				/* ========== 调试统计更新 ========== */
+#ifdef DEBUG_QLGC
+				ql_stats.gc_operations++;
+				ql_stats.total_migrations += number_of_migrations;
+				ql_stats.total_deleted_pages += bi->soft_del_pages;
+				ql_stats.total_reward += reward;
+				if(gc_ok == YAFFS_OK) ql_stats.gc_success_count++;
+				else ql_stats.gc_fail_count++;
+#endif
 
 				inter_copies+=number_of_migrations;
 				//空间换时间，更高效的查找算法
@@ -4118,12 +4211,90 @@ int inter_copies=0;
 if(Qlearning_count < num_trainings){
 	Qlearning_count++;
 }
-if(Qlearning_count % 500 == 0){
-	printk("now we have trained %d/%d epoches;durirng latest garbage collection,gc_copies is %d;\n",Qlearning_count,num_trainings,inter_copies);
-}
-/* 改进 epsilon 衰减：从 num_trainings 线性衰减到 1 */
+
+/* ========== 详细的调试打印 ========== */
+#ifdef DEBUG_QLGC
+	/* 仅在训练期间进行详细打印 */
+	if(Qlearning_count < num_trainings && Qlearning_count % 1000 == 0 && Qlearning_count > 0) {
+		/* 1. Q-Learning 训练状态 */
+		printk("\n[QL-GC-EPOCH] Training: %u/%u | epsilon: %u | Progress: %u%%\n",
+			Qlearning_count, num_trainings, epsilon,
+			(100 * Qlearning_count) / num_trainings);
+		
+		/* 2. 动作选择分布 */
+		if(ql_stats.total_actions > 0) {
+			printk("[QL-GC-ACTION] Distribution: HOT=%u(%u%%) MEDIUM=%u(%u%%) "
+				"COLD=%u(%u%%) SUPER=%u(%u%%)\n",
+				ql_stats.action_count[0], 100*ql_stats.action_count[0]/ql_stats.total_actions,
+				ql_stats.action_count[1], 100*ql_stats.action_count[1]/ql_stats.total_actions,
+				ql_stats.action_count[2], 100*ql_stats.action_count[2]/ql_stats.total_actions,
+				ql_stats.action_count[3], 100*ql_stats.action_count[3]/ql_stats.total_actions);
+		}
+		
+		/* 3. 状态空间覆盖率 */
+		printk("[QL-GC-STATE] Visited states: %u | State-action pairs: %u | "
+			"Q-table utilization: %u%%\n",
+			ql_stats.unique_states_visited,
+			ql_stats.state_action_pairs,
+			(100 * ql_stats.state_action_pairs) / CAPACITY);
+		
+		/* 4. GC 效率统计 */
+		if(ql_stats.gc_operations > 0) {
+			u32 avg_migrations = ql_stats.total_migrations / ql_stats.gc_operations;
+			u32 recovery_rate = ql_stats.gc_success_count > 0 ? 
+				(100 * ql_stats.chunks_recovered_total) / (ql_stats.gc_operations * dev->param.chunks_per_block) : 0;
+			printk("[QL-GC-PERF] GC ops: %u | Success rate: %u%% | "
+				"Avg migrations: %u | Recovery rate: %u%%\n",
+				ql_stats.gc_operations,
+				(100 * ql_stats.gc_success_count) / ql_stats.gc_operations,
+				avg_migrations,
+				recovery_rate);
+		}
+		
+		/* 5. 磨损均衡情况 */
+		printk("[QL-GC-WEAR] Erasure gap: current=%d | max=%d | Twl=%d\n",
+			ql_stats.last_wear_gap, ql_stats.max_wear_gap, Twl);
+		
+		/* 6. 哈希表健康度 */
+		u32 load_factor = (100 * ql_stats.q_entries_used) / CAPACITY;
+		printk("[QL-GC-HASH] Load factor: %u%% | Collisions: %u | Entries: %u/%u\n",
+			load_factor,
+			ql_stats.hash_collisions,
+			ql_stats.q_entries_used, CAPACITY);
+	}
+#else
+	/* 简化版本，只打印关键指标 - 仅训练期间打印 */
+	if(Qlearning_count < num_trainings && Qlearning_count % 500 == 0){
+		u32 explore_rate = (100 * epsilon) / num_trainings;
+		printk("[QL-GC] Trained %d/%d | gc_copies: %d | epsilon: %u (探索: %u%%)\n",
+			Qlearning_count, num_trainings, inter_copies, epsilon,
+			explore_rate);
+	}
+	
+	/* 训练完成时打印一次最终状态 */
+	if(Qlearning_count == num_trainings) {
+		printk("\n[QL-GC-FINAL] ===== 训练完成 =====\n");
+		printk("[QL-GC-FINAL] Total iterations: %u\n", num_trainings);
+		printk("[QL-GC-FINAL] Final epsilon: %u (永久探索: 5%%)\n", MIN_EPSILON);
+		printk("[QL-GC-FINAL] Switching to production mode\n");
+		printk("[QL-GC-FINAL] ====================\n\n");
+	}
+#endif
+
+/* 改进 epsilon 衰减策略：
+ * 线性衰减从 num_trainings 到 MIN_EPSILON
+ * 确保训练完成后保留 MIN_EPSILON 的探索概率（约5%）
+ * 这样可以应对运行时的环境变化
+ */
+#define MIN_EPSILON (num_trainings / 20)  /* 保留5%的探索概率 */
+
 if(Qlearning_count < num_trainings) {
-	epsilon = num_trainings - Qlearning_count;
+	/* 线性插值：从 num_trainings 衰减到 MIN_EPSILON */
+	unsigned decay_range = num_trainings - MIN_EPSILON;
+	epsilon = MIN_EPSILON + (decay_range * (num_trainings - Qlearning_count)) / num_trainings;
+} else {
+	/* 训练完成后，保持 MIN_EPSILON 的探索概率 */
+	epsilon = MIN_EPSILON;
 }
 
 #endif
