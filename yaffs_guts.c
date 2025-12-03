@@ -227,7 +227,7 @@ struct State* get_usable_state(struct yaffs_ext_tags *tags, unsigned aver_uft) {
     unsigned cnt ;
 
     get_time_hot(tags->obj_id,tags->chunk_id, &time, &cnt);
-	int uft=(now-time)/cnt; 
+	int uft = (cnt > 0) ? (now - time) / cnt : (now - time);  /* 修复除零风险 */ 
 
     // 分配内存给 state
     struct State* state = (struct State*)kvmalloc(sizeof(struct State), GFP_KERNEL);
@@ -253,7 +253,7 @@ unsigned int hashStateActionPair(struct State* state, enum Action action) {
     int index = (state->uft_flag<<2) | ac_num;
 	if(index>=CAPACITY){ 
 		printk("error index in %d",__LINE__);
-		return index-CAPACITY;
+		return index % CAPACITY;  /* 使用模运算避免超界 */
 	}
 	return index; 
 
@@ -307,8 +307,8 @@ struct QTableEntry* findOrInsertQEntry(struct QTableEntry* table, struct State* 
 
 //exploit阶段获取当前状态下最佳action
 enum Action getbestaction(struct QTableEntry* table,struct State* state){
-	int maxqvalue=-9999;
-	enum Action action;
+	int maxqvalue=-2147483648;  /* INT_MIN */
+	enum Action action=ACTION_ZERO;  /* 初始化防止未定义行为 */
 	u32 i;
 	for( i=0;i<4;i++){
 		enum Action temp;
@@ -317,7 +317,7 @@ enum Action getbestaction(struct QTableEntry* table,struct State* state){
 		else if(i==2) temp=ACTION_TWO;
 		else if(i==3) temp=ACTION_THREE;
 		struct QTableEntry * temp_QE=findOrInsertQEntry(table,state, temp);
-		if(temp_QE->qValue > maxqvalue){
+		if(temp_QE && temp_QE->qValue > maxqvalue){  /* 添加NULL检查 */
 			maxqvalue=temp_QE->qValue;
 		    action=temp;
 		}
@@ -332,7 +332,8 @@ enum Action getrandomaction(struct QTableEntry* table,struct State* state){
 	else if(i==1) temp=ACTION_ONE;
 	else if(i==2) temp=ACTION_TWO;
 	else if(i==3) temp=ACTION_THREE;
-	findOrInsertQEntry(table,state, temp);
+	struct QTableEntry* entry = findOrInsertQEntry(table,state, temp);
+	if(entry) {}  /* 确保条目存在 */
 	return temp; 
 }
 
@@ -350,7 +351,7 @@ enum Action getaction(struct QTableEntry *table,struct State* state){
 
 int getqvalue(struct QTableEntry* table,struct State* state, enum Action action){
 	struct QTableEntry* temp=findOrInsertQEntry(table, state, action);
-	return temp->qValue;
+	return (temp != NULL) ? temp->qValue : 0;  /* 添加NULL检查 */
 }
 //获取当前状态下最大q值
 int getbestqvalue(struct QTableEntry* table,struct State* state){
@@ -363,7 +364,7 @@ int getbestqvalue(struct QTableEntry* table,struct State* state){
 		else if(i==2) temp=ACTION_TWO;
 		else if(i==3) temp=ACTION_THREE;
 		struct QTableEntry* temp_QE=findOrInsertQEntry(table,state, temp);
-		if(temp_QE->qValue > maxqvalue){
+		if(temp_QE && temp_QE->qValue > maxqvalue){  /* 添加NULL检查 */
 			maxqvalue=temp_QE->qValue;
 		}
 	}
@@ -388,6 +389,9 @@ int getreward(int num_gc_copies,int deleted_pages,int time){
 	if(num_gc_copies==0 || deleted_pages==0) reward=128;
 	else 
 		reward=num_gc_copies < deleted_pages? (10*deleted_pages/num_gc_copies)/10:(10*num_gc_copies/deleted_pages)/10;
+	
+	/* 修复内核环境：避免除零 */
+	if(time <= 0) time = 1;
 	return reward/time;
 }
 
@@ -396,18 +400,25 @@ int updateQValue_q(struct QTableEntry* table, struct State* laststate,
     struct QTableEntry* lastentry = findOrInsertQEntry(table,laststate, lastaction);  
 	int best_current_qValue = getbestqvalue(table,currentstate);
     if (lastentry) {  
-        lastentry->qValue += learningRate * (discountFactor * best_current_qValue/10 - lastentry->qValue)/10;  
+        /* 使用 int64_t 避免整数溢出 */
+        int64_t target = ((int64_t)discountFactor * best_current_qValue) / 10;
+        int64_t td_error = target - lastentry->qValue;
+        int64_t update = ((int64_t)learningRate * td_error) / 10;
+        lastentry->qValue += (int)update;  
     }  
-	return lastentry->qValue;
+	return lastentry ? lastentry->qValue : 0;
 }  
 //仅有reward
 int updateQValue_r(struct QTableEntry* table, struct State* laststate,
 	enum Action lastaction,int reward) {  
     struct QTableEntry* lastentry = findOrInsertQEntry(table,laststate, lastaction);  
     if (lastentry) {  
-        lastentry->qValue += learningRate * (reward - lastentry->qValue)/10;  
+        /* 使用 int64_t 避免整数溢出 */
+        int64_t delta = reward - lastentry->qValue;
+        int64_t update = ((int64_t)learningRate * delta) / 10;
+        lastentry->qValue += (int)update;  
     }  
-	return lastentry->qValue;
+	return lastentry ? lastentry->qValue : 0;
 } 
 
 void update_to_handle_overflow(struct QTableEntry* table,int temp_qValue,struct State* state,
@@ -421,10 +432,10 @@ void update_to_handle_overflow(struct QTableEntry* table,int temp_qValue,struct 
 		else if(i==2) temp=ACTION_TWO;
 		else if(i==3) temp=ACTION_THREE;
 		struct QTableEntry* temp_QE=findOrInsertQEntry(table,state, temp);
-		if(temp_QE->qValue >= 0){
+		if(temp_QE && temp_QE->qValue >= 0){  /* 添加NULL检查 */
 			temp_QE->qValue-=2147483647;
 		}
-		else{
+		else if(temp_QE){
 			temp_QE->qValue+=2147483647;
 		}
 	}		
@@ -439,7 +450,7 @@ void update_to_handle_overflow(struct QTableEntry* table,int temp_qValue,struct 
 		else if(i==2) temp=ACTION_TWO;
 		else if(i==3) temp=ACTION_THREE;
 		struct QTableEntry* temp_QE=findOrInsertQEntry(table,state, temp);
-		if(temp_QE->qValue < minqvalue){
+		if(temp_QE && temp_QE->qValue < minqvalue){  /* 添加NULL检查 */
 			minqvalue=temp_QE->qValue;
 		}
 	}
@@ -449,7 +460,9 @@ void update_to_handle_overflow(struct QTableEntry* table,int temp_qValue,struct 
 		else if(i==2) temp=ACTION_TWO;
 		else if(i==3) temp=ACTION_THREE;
 		struct QTableEntry* temp_QE=findOrInsertQEntry(table,state, temp);
-		temp_QE->qValue-=minqvalue;
+		if(temp_QE){  /* 添加NULL检查 */
+			temp_QE->qValue-=minqvalue;
+		}
 	}		
 	}
 
@@ -4102,15 +4115,16 @@ int inter_copies=0;
 
 //add by ry 2024.04.30
 #if defined(GC_Qlearning)
-	if(Qlearning_count < num_trainings){
-		Qlearning_count++;
-	}
-	if(Qlearning_count % 500 == 0 && epsilon > 1000){
-		printk("now we have trained %d/%d epoches;durirng latest garbage collection,gc_copies is %d;\n",Qlearning_count,num_trainings,inter_copies);
-	}
-	// if(Qlearning_count % 500 == 0 && epsilon == 1000)
-	// 	printk("durirng latest garbage collection,gc_copies is %d;\n",inter_copies);
-	epsilon = epsilon > 1000 ?  epsilon-1:epsilon;
+if(Qlearning_count < num_trainings){
+	Qlearning_count++;
+}
+if(Qlearning_count % 500 == 0){
+	printk("now we have trained %d/%d epoches;durirng latest garbage collection,gc_copies is %d;\n",Qlearning_count,num_trainings,inter_copies);
+}
+/* 改进 epsilon 衰减：从 num_trainings 线性衰减到 1 */
+if(Qlearning_count < num_trainings) {
+	epsilon = num_trainings - Qlearning_count;
+}
 
 #endif
 //add end
