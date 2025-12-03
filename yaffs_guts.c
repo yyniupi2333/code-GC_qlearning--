@@ -87,6 +87,45 @@ uint32_t fixed_log2(uint32_t x) {
     return m_q15 + g;
 }
 
+/**
+ * 计算两个数的几何平均数（纯整数运算）
+ * 几何平均 = sqrt(a * b) ≈ 2^((log2(a) + log2(b))/2)
+ * 
+ * 使用定点算术避免浮点数
+ */
+static inline s64 geometric_mean(s64 a, s64 b) {
+	if (a <= 0 || b <= 0) {
+		/* 边界情况：返回算术平均 */
+		return (a + b) / 2;
+	}
+	
+	/* 计算对数和 */
+	uint32_t log_a = fixed_log2((uint32_t)a);
+	uint32_t log_b = fixed_log2((uint32_t)b);
+	uint32_t log_sum = log_a + log_b;
+	uint32_t log_avg = log_sum / 2;  /* 对数平均 */
+	
+	/* 转换回线性空间：2^(log_avg) */
+	/* 使用近似：2^x ≈ (x >> 15) * (1 + (x & 0x7FFF) / 32768) */
+	uint32_t frac = log_avg & 0x7FFF;  /* 小数部分 */
+	uint32_t int_part = log_avg >> 15;  /* 整数部分 */
+	
+	if (int_part >= 31) return LLONG_MAX;  /* 防止溢出 */
+	
+	/* 近似计算 2^frac，使用泰勒展开 */
+	/* 2^x ≈ 1 + x*ln(2) + (x*ln(2))^2/2 + ... */
+	/* 简化：使用查表或直接计算 */
+	u64 result = 1ULL << int_part;
+	
+	/* 调整小数部分的贡献 */
+	if (frac > 0) {
+		/* 2^(frac/32768) ≈ 1 + frac*ln(2)/32768 */
+		result = result + (result * frac) / (32768 / 1);  /* ln(2) ≈ 1 */
+	}
+	
+	return (s64)result;
+}
+
 
 #endif
 
@@ -247,26 +286,177 @@ struct {
 
 #endif
 
-unsigned get_uft_flag(unsigned uft,unsigned aver_uft){
-	// return (16*uft/aver_uft)%64;
-	/*vesion1*/
-	// if(uft / 100 < 63){
-	// 	return (uft / 100) % 63;
-	// }
-	// return 63;
-	/*vesion2*/
-	// if(uft / aver_uft < 63){
-	// 	return (uft / aver_uft) % 63;
-	// }
-	// return 63;
-
-	/*vesion3*/
-	int32_t temp = fixed_log2(1+uft / aver_uft);
-	if(temp < 63){
-		return temp % 63;
+/* ============ 简化离散化器 - 用于UFT特征离散化 ============ */
+/* 每个分组独立维护min/max值 */
+/* 注意：Q表有64个状态，所以最多支持64个分组 */
+struct {
+	/* 分组信息 */
+	struct {
+		s64 min_val;        /* 该分组的最小值 */
+		s64 max_val;        /* 该分组的最大值 */
+		u32 sample_count;   /* 该分组的样本数 */
+	} groups[64];           /* 支持最多64个分组，每个分组对应一个状态ID */
+	u32 group_count;        /* 活跃分组数 */
+	u32 total_samples;      /* 总采样次数 */
+} uft_discretizer = {
+	.group_count = 1,
+	.total_samples = 0,
+	.groups = {
+		[0] = { .min_val = LLONG_MAX, .max_val = LLONG_MIN, .sample_count = 0 },
 	}
-	return 63;
+};
+
+/* 离散器打印计数器：每执行100次GC打印一次分组范围 */
+static u32 discretizer_print_count = 0;
+
+/**
+ * 打印所有活跃分组的范围信息
+ */
+static void print_discretizer_groups(void) {
+	u32 i;
+	if (uft_discretizer.group_count == 0) return;
 	
+	printk("[UFT-Discretizer] Group count: %u, Total samples: %u\n", 
+	       uft_discretizer.group_count, uft_discretizer.total_samples);
+	
+	for (i = 0; i < uft_discretizer.group_count; i++) {
+		printk("  Group-%u: [%lld, %lld] samples=%u\n",
+		       i,
+		       uft_discretizer.groups[i].min_val,
+		       uft_discretizer.groups[i].max_val,
+		       uft_discretizer.groups[i].sample_count);
+	}
+}
+
+/**
+ * 离散化UFT值 - 替代 get_uft_flag()
+ * 将连续的UFT值自适应地离散化为 0-63 的分组ID
+ * 
+ * 关键条件：
+ * - 每个分组必须满足：max_val < 2 * min_val
+ * - 当某分组违反该条件且样本数足够时，进行分裂
+ * - 最多8个分组（以节省状态空间）
+ */
+unsigned discretize_uft_value(s64 uft_value) {
+	u32 best_group = 0;
+	s32 left, right, mid;
+	
+	/* 第一个样本：初始化第一个分组 */
+	if (uft_discretizer.total_samples == 0) {
+		uft_discretizer.groups[0].min_val = uft_value;
+		uft_discretizer.groups[0].max_val = uft_value;
+		uft_discretizer.groups[0].sample_count = 1;
+		uft_discretizer.total_samples = 1;
+		return 0;
+	}
+	
+	uft_discretizer.total_samples++;
+	
+	/* ===== 二分查找：找到值应该属于的分组 ===== */
+	/* 分组按创建顺序有序：groups[0].max <= groups[1].min <= groups[1].max <= ... */
+	left = 0;
+	right = (s32)uft_discretizer.group_count - 1;
+	
+	while (left <= right) {
+		mid = left + (right - left) / 2;
+		s64 group_min = uft_discretizer.groups[mid].min_val;
+		s64 group_max = uft_discretizer.groups[mid].max_val;
+		
+		/* 精确匹配：值在该分组范围内 */
+		if (uft_value >= group_min && uft_value <= group_max) {
+			best_group = mid;
+			break;
+		}
+		/* 值小于中间分组，搜索左半部分 */
+		else if (uft_value < group_min) {
+			right = mid - 1;
+		}
+		/* 值大于中间分组，搜索右半部分 */
+		else {
+			left = mid + 1;
+		}
+	}
+	
+	/* 二分查找结束后，left指向第一个min > uft_value的分组 */
+	/* 如果没有精确匹配，选择left作为扩展分组 */
+	if (uft_value < uft_discretizer.groups[best_group].min_val || 
+	    uft_value > uft_discretizer.groups[best_group].max_val) {
+		if (left < (s32)uft_discretizer.group_count) {
+			best_group = left;
+		} else {
+			/* 值大于所有分组，扩展最后一个分组 */
+			best_group = uft_discretizer.group_count - 1;
+		}
+	}
+	
+	/* 更新该分组的范围 */
+	if (uft_discretizer.groups[best_group].sample_count == 0) {
+		uft_discretizer.groups[best_group].min_val = uft_value;
+		uft_discretizer.groups[best_group].max_val = uft_value;
+	} else {
+		if (uft_value < uft_discretizer.groups[best_group].min_val) 
+			uft_discretizer.groups[best_group].min_val = uft_value;
+		if (uft_value > uft_discretizer.groups[best_group].max_val) 
+			uft_discretizer.groups[best_group].max_val = uft_value;
+	}
+	uft_discretizer.groups[best_group].sample_count++;
+	
+	/* ===== 检查是否需要分裂 ===== */
+	/* 条件1：样本数足够（至少100个） */
+	/* 条件2：该分组违反 max < 2*min 的条件 */
+	/* 条件3：还有分组空间（< 64个，因为Q表只有64个状态） */
+	if (uft_discretizer.groups[best_group].sample_count >= 100 &&
+		uft_discretizer.group_count < 64 &&
+		uft_discretizer.groups[best_group].min_val > 0) {
+		
+		s64 group_min = uft_discretizer.groups[best_group].min_val;
+		s64 group_max = uft_discretizer.groups[best_group].max_val;
+		
+		/* 检查是否违反 max < 2*min 条件 */
+		int violates_condition = (group_max >= 2 * group_min);
+		
+		if (violates_condition) {
+			/* 分裂：使用几何平均作为分裂点 */
+			s64 split_point = geometric_mean(group_min, group_max);
+			u32 new_group_idx;
+			
+			/* 确保分裂点在有效范围内 */
+			if (split_point <= group_min) {
+				split_point = group_min + 1;
+			}
+			if (split_point >= group_max) {
+				split_point = group_max - 1;
+			}
+			
+			new_group_idx = uft_discretizer.group_count;
+			
+			/* 新分组：[split_point, group_max] */
+			uft_discretizer.groups[new_group_idx].min_val = split_point;
+			uft_discretizer.groups[new_group_idx].max_val = group_max;
+			uft_discretizer.groups[new_group_idx].sample_count = 0;
+			
+			/* 旧分组调整：[group_min, split_point] */
+			uft_discretizer.groups[best_group].max_val = split_point;
+			
+			uft_discretizer.group_count++;
+		}
+	}
+	
+	/* 直接返回分组ID作为状态ID（0-63） */
+	/* 每个分组对应一个唯一的状态，不需要重新映射 */
+	
+	/* 每执行100次离散化，打印一次分组信息 */
+	discretizer_print_count++;
+	if (discretizer_print_count % 100 == 0) {
+		print_discretizer_groups();
+	}
+	
+	return best_group % 64;  /* 安全防护：确保不超过64 */
+}
+
+unsigned get_uft_flag(unsigned uft, unsigned aver_uft) {
+	/* 使用离散化器替代之前的固定策略 */
+	return discretize_uft_value(uft);
 }
 
 struct State* get_usable_state(struct yaffs_ext_tags *tags, unsigned aver_uft) {
