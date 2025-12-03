@@ -190,29 +190,50 @@ static void fagc_update_alpha(int cnt)
 未精确区分一个文件中的逻辑页，可用chunk_id的高八位表示
 文件id或许不用那么精确地区分？
 */
-static struct fagc_hdt_item hdt[4194304];
-void get_time_hot(unsigned object_id,unsigned chunk_id, unsigned *time, int *cnt )
-{
-	unsigned index;
+// static struct fagc_hdt_item hdt[4194304];
+// void get_time_hot(unsigned object_id,unsigned chunk_id, unsigned *time, int *cnt )
+// {
+// 	unsigned index;
 
-	index = (chunk_id&0xff)|(object_id<<8);
-	if(index>=4194304) printk("unusable index ,locate in %d",__LINE__);
+// 	index = (chunk_id&0xff)|(object_id<<8);
+// 	if(index>=4194304) printk("unusable index ,locate in %d",__LINE__);
 
-	*time=hdt[index].time;
-	*cnt=hdt[index].cnt;
+// 	*time=hdt[index].time;
+// 	*cnt=hdt[index].cnt;
 	
-}
+// }
+// void set_time_hot(unsigned object_id,unsigned chunk_id, unsigned time,int cnt)
+// {
+// 	unsigned index;
 
-void set_time_hot(unsigned object_id,unsigned chunk_id, unsigned time,int cnt)
+// 	index = (chunk_id&0xff)|(object_id<<8);
+// 	if(index>=4194304) printk("unusable index ,locate in %d",__LINE__);
+// 	hdt[index].time=time;
+// 	hdt[index].cnt=cnt;
+
+// }
+static unsigned int PSN = 0;
+static unsigned ages[4194304];
+void get_age(unsigned object_id,unsigned chunk_id, unsigned *age )
 {
 	unsigned index;
 
 	index = (chunk_id&0xff)|(object_id<<8);
 	if(index>=4194304) printk("unusable index ,locate in %d",__LINE__);
-	hdt[index].time=time;
-	hdt[index].cnt=cnt;
+
+	*age = ages[index];
+}
+void set_age(unsigned object_id,unsigned chunk_id, unsigned psn)
+{
+	unsigned index;
+
+	index = (chunk_id&0xff)|(object_id<<8);
+	if(index>=4194304) printk("unusable index ,locate in %d",__LINE__);
+	ages[index] = psn;
 
 }
+
+
 #endif
 
 
@@ -243,7 +264,7 @@ void set_time_hot(unsigned object_id,unsigned chunk_id, unsigned time,int cnt)
 		static unsigned epsilon=num_trainings;//探索率
 
 /* ============ 调试监控统计结构体 ============ */
-#define DEBUG_QLGC  /* 启用调试信息 */
+#undef DEBUG_QLGC  /* 启用调试信息 */
 
 #ifdef DEBUG_QLGC
 struct {
@@ -459,13 +480,29 @@ unsigned get_uft_flag(unsigned uft, unsigned aver_uft) {
 	return discretize_uft_value(uft);
 }
 
-struct State* get_usable_state(struct yaffs_ext_tags *tags, unsigned aver_uft) {
-    unsigned now = TIME_NOW;
-    unsigned time ;
-    unsigned cnt ;
+// struct State* get_usable_state(struct yaffs_ext_tags *tags, unsigned aver_uft) {
+//     unsigned now = TIME_NOW;
+//     unsigned time ;
+//     unsigned cnt ;
 
-    get_time_hot(tags->obj_id,tags->chunk_id, &time, &cnt);
-	int uft = (cnt > 0) ? (now - time) / cnt : (now - time);  /* 修复除零风险 */ 
+//     get_time_hot(tags->obj_id,tags->chunk_id, &time, &cnt);	
+
+// 	   int uft = (cnt > 0) ? (now - time) / cnt : (now - time);  /* 修复除零风险 */ 
+
+//     // 分配内存给 state
+//     struct State* state = (struct State*)kvmalloc(sizeof(struct State), GFP_KERNEL);
+//     if (!state) {
+//         printk("Error: Memory allocating failed\n");
+//         return NULL;
+//     }
+//     state->uft_flag=get_uft_flag(uft,aver_uft);
+//     return state;
+// }
+struct State* get_usable_state(struct yaffs_ext_tags *tags, unsigned aver_uft) {
+    unsigned age;
+	get_age(tags->obj_id,tags->chunk_id, &age);
+	PSN++;
+	int uft = PSN - age;  /* 使用PSN和age计算uft */
 
     // 分配内存给 state
     struct State* state = (struct State*)kvmalloc(sizeof(struct State), GFP_KERNEL);
@@ -1697,14 +1734,15 @@ static int yaffs_write_new_chunk_for_migration(struct yaffs_dev *dev,
 // add by ry 2024.05.10
 #if defined(GC_Qlearning)
 		unsigned now = jiffies;
-		unsigned time = 0;
-		unsigned cnt  = 0;
+		// unsigned time = 0;
+		// unsigned cnt  = 0;
+		unsigned age;
 		unsigned block;
 		unsigned index;
 		struct State* current_state=NULL;
 		enum Action current_action;
 		int hot=0;
-		get_time_hot(tags->obj_id,tags->chunk_id, &time, &cnt);
+		// get_time_hot(tags->obj_id,tags->chunk_id, &time, &cnt);
 		current_state=get_usable_state(tags,aver_uft);
 		if(current_state==NULL) printk("error with get_usable_state in %d",__LINE__);
 		if(new_start) {//第一次垃圾回收的初始状态
@@ -1723,7 +1761,8 @@ static int yaffs_write_new_chunk_for_migration(struct yaffs_dev *dev,
 		insertHashTable(current_state, current_action,block) ;
 		last_state=current_state;
 		last_action=current_action;		
-		set_time_hot(tags->obj_id,tags->chunk_id, now, ++cnt); 
+		//set_time_hot(tags->obj_id,tags->chunk_id, now, ++cnt); 
+		set_age(tags->obj_id,tags->chunk_id, PSN); 
 //add end
 #else	/* Original version */
 
@@ -1844,8 +1883,8 @@ static int yaffs_write_new_chunk(struct yaffs_dev *dev,
 		extern int max_objid;
 		extern int max_chunkid;
 		unsigned now = jiffies;
-		unsigned time,cnt;    
-		get_time_hot(tags->obj_id,tags->chunk_id, &time, &cnt);
+		// unsigned time,cnt;    
+		// get_time_hot(tags->obj_id,tags->chunk_id, &time, &cnt);
         // if(0 == time)
         // {
         //     time = now;
@@ -1853,7 +1892,8 @@ static int yaffs_write_new_chunk(struct yaffs_dev *dev,
 		if(tags->obj_id>max_objid) max_objid=tags->obj_id;
 		chunk = yaffs_alloc_chunk(dev, use_reserver, &bi, hot);
 		if(chunk>max_chunkid) max_chunkid=chunk;
-		set_time_hot(tags->obj_id,tags->chunk_id, now, ++cnt);
+		// set_time_hot(tags->obj_id,tags->chunk_id, now, ++cnt);
+		set_age(tags->obj_id,tags->chunk_id, ++PSN);
 		
 #else	/* Original version */
 		chunk = yaffs_alloc_chunk(dev, use_reserver, &bi);
@@ -3785,22 +3825,22 @@ static int yaffs_gc_block(struct yaffs_dev *dev, int block, int whole_block,int 
 
 		max_copies = (whole_block) ? dev->param.chunks_per_block : 5;
 		old_chunk = block * dev->param.chunks_per_block + dev->gc_chunk;
-#ifdef GC_Qlearning 
-/* started add by hy 2018.1.9 */
-       //here we caculate the average_uft
-        unsigned now = TIME_NOW;
-		for(j = dev->internal_start_block; j <= dev->internal_end_block;  j++)
-		{
-           tmp_bi = yaffs_get_block_info(dev,j);
-		   if (tmp_bi->block_state == YAFFS_BLOCK_STATE_FULL)
-		   {
-		     pages_used = tmp_bi->pages_in_use - tmp_bi->soft_del_pages;
-		     aver_uft += (((now - time_alloc_block[j-1]) * pages_used) / dev->param.chunks_per_block);
-			 full_block_cnt++;
-		   }
-		}
-		aver_uft /= full_block_cnt;  //get average value
-#endif
+// #ifdef GC_Qlearning 
+// /* started add by hy 2018.1.9 */
+//        //here we caculate the average_uft
+//         unsigned now = TIME_NOW;
+// 		for(j = dev->internal_start_block; j <= dev->internal_end_block;  j++)
+// 		{
+//            tmp_bi = yaffs_get_block_info(dev,j);
+// 		   if (tmp_bi->block_state == YAFFS_BLOCK_STATE_FULL)
+// 		   {
+// 		     pages_used = tmp_bi->pages_in_use - tmp_bi->soft_del_pages;
+// 		     aver_uft += (((now - time_alloc_block[j-1]) * pages_used) / dev->param.chunks_per_block);
+// 			 full_block_cnt++;
+// 		   }
+// 		}
+// 		aver_uft /= full_block_cnt;  //get average value
+// #endif
 
 
 		for (/* init already done */ ;
@@ -6401,7 +6441,8 @@ int yaffs_guts_initialise(struct yaffs_dev *dev)
 	u32 x;
 	u32 bits;
 #if defined(GC_Qlearning)
-	memset( hdt,0,sizeof(hdt));
+	// memset( hdt,0,sizeof(hdt));
+	memset( ages,0,sizeof(ages));
     memset(sum_block,0,sizeof(sum_block));
 	memset(time_alloc_block,0,sizeof(time_alloc_block));
 	start_time = jiffies;
