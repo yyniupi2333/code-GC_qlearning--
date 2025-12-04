@@ -269,7 +269,8 @@ struct HashNode *BTable[BLOCK_NUMBER] = {NULL};
 // new
 struct block_alloc_time bat[BLOCK_NUMBER];
 // end
-static u32 CAPACITY = 256;
+#define NUM_GROUP 256
+static u32 CAPACITY = 4 * NUM_GROUP;
 int learningRate = 1;						 // learningRate_mul_ten
 int discountFactor = 5;						 // discountFactor_mul_ten
 const static unsigned num_trainings = 50000; // 小q表减少训练次数
@@ -327,7 +328,7 @@ struct
 
 /* ============ 简化离散化器 - 用于UFT特征离散化 ============ */
 /* 每个分组独立维护min/max值 */
-/* 注意：Q表有64个状态，所以最多支持64个分组 */
+/* 注意：Q表有NUM_GROUP个状态，所以最多支持NUM_GROUP个分组 */
 struct
 {
 	/* 分组信息 */
@@ -336,7 +337,7 @@ struct
 		s64 min_val;	  /* 该分组的最小值 */
 		s64 max_val;	  /* 该分组的最大值 */
 		u32 sample_count; /* 该分组的样本数 */
-	} groups[64];		  /* 支持最多64个分组，每个分组对应一个状态ID */
+	} groups[NUM_GROUP];		  /* 支持最多NUM_GROUP个分组，每个分组对应一个状态ID */
 	u32 group_count;	  /* 活跃分组数 */
 	u32 total_samples;	  /* 总采样次数 */
 } uft_discretizer = {
@@ -462,7 +463,7 @@ unsigned discretize_uft_value(s64 uft_value)
 	/* 条件2：该分组违反 max < 2*min 的条件 */
 	/* 条件3：还有分组空间（< 64个，因为Q表只有64个状态） */
 	if (uft_discretizer.groups[best_group].sample_count >= 100 &&
-		uft_discretizer.group_count < 64 &&
+		uft_discretizer.group_count < NUM_GROUP &&
 		uft_discretizer.groups[best_group].min_val > 0)
 	{
 
@@ -511,7 +512,7 @@ unsigned discretize_uft_value(s64 uft_value)
 	// 	print_discretizer_groups();
 	// }
 
-	return best_group % 64; /* 安全防护：确保不超过64 */
+	return best_group % NUM_GROUP; /* 安全防护：确保不超过组数 */
 }
 
 unsigned get_uft_flag(unsigned uft, unsigned aver_uft)
@@ -4779,8 +4780,8 @@ static int yaffs_check_gc(struct yaffs_dev *dev, int background)
 			   Qlearning_count, num_trainings, epsilon,
 			   (100 * Qlearning_count) / num_trainings);
 			   
-		printk("\n[QL-GC-GROUP] Group count: %u / 64\n",
-		uft_discretizer.group_count);
+		printk("\n[QL-GC-GROUP] Group count: %u / %u\n",
+		uft_discretizer.group_count, NUM_GROUP);
 
 
 		/* 2. 动作选择分布 */
